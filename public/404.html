@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="refresh" content="0; url=/lasthealthai/" />
+    <script>
+      const target = '/lasthealthai/';
+      if (window.location.pathname !== '/lasthealthai/' && !window.location.pathname.startsWith('/lasthealthai/')) {
+        window.location.replace(target);
+      } else {
+        window.location.replace(target + (window.location.hash || ''));
+      }
+    </script>
+    <title>Redirecting...</title>
+  </head>
+  <body>
+    Redirecting to the VitaAI app...
+  </body>
+</html>
