@@ -1,0 +1,1160 @@
+import {
+  WLWeightRecord,
+  WLMealEntry,
+  WLWaterRecord,
+  WLActivityRecord,
+  WLGoal,
+  WLCoachMessage,
+  WLDailyNutritionSummary,
+  WLDashboardData,
+  WLProgressPeriod,
+  WLPeriodDateRange,
+  WLPeriodHabitMetrics,
+} from './WLTypes';
+import { supabase } from '../../core/supabase';
+
+export function getLocalDateString(dateInput?: Date | string): string {
+  if (typeof dateInput === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateInput.trim())) {
+    return dateInput.trim();
+  }
+  const d = dateInput ? (typeof dateInput === 'string' ? new Date(dateInput) : dateInput) : new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Normalizes input source to the exact uppercase values permitted by public.meal_log_entries
+ * CHECK (input_source IN ('SCAN', 'GALLERY', 'SEARCH', 'MANUAL'))
+ */
+export function mapInputSourceToDb(source?: string | null): 'SCAN' | 'GALLERY' | 'SEARCH' | 'MANUAL' {
+  if (!source) return 'MANUAL';
+  const normalized = source.trim().toUpperCase();
+  if (normalized === 'SCAN') return 'SCAN';
+  if (normalized === 'GALLERY') return 'GALLERY';
+  if (normalized === 'SEARCH') return 'SEARCH';
+  if (normalized === 'MANUAL') return 'MANUAL';
+  if (normalized === 'QUICK') return 'MANUAL';
+  return 'MANUAL';
+}
+
+async function requireAuthUser() {
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError || !authData?.user) {
+    throw new Error('Authentication required: You must be signed in with an active account to access Weight Loss data.');
+  }
+  return authData.user;
+}
+
+function mapMealRow(row: any): WLMealEntry {
+  return {
+    id: String(row.id),
+    type: (row.meal_type || 'snack') as WLMealEntry['type'],
+    name: row.food_name || 'Meal',
+    calories: Number(row.calories || 0),
+    proteinG: Number(row.protein_g || 0),
+    carbsG: Number(row.carbs_g || 0),
+    fatG: Number(row.fat_g || 0),
+    fiberG: row.fiber_g !== null && row.fiber_g !== undefined ? Number(row.fiber_g) : undefined,
+    serving: row.serving || undefined,
+    inputSource: row.input_source || undefined,
+    loggedAt: row.recorded_at || row.created_at || new Date().toISOString(),
+    nutritionScore:
+      row.nutrition_score !== null && row.nutrition_score !== undefined
+        ? Number(row.nutrition_score)
+        : undefined,
+    nutritionScoreLabel: row.score_label || undefined,
+    aiInsight: row.ai_insight || undefined,
+    aiNote: row.ai_note || undefined,
+    notes: row.ai_note || undefined,
+    aiChoiceStatus: row.health_classification || undefined,
+    recommendations: Array.isArray(row.ai_suggestions) ? row.ai_suggestions : undefined,
+  };
+}
+
+function mapActivityRow(row: any): WLActivityRecord {
+  const dateStr = row.activity_date
+    ? new Date(`${row.activity_date}T12:00:00Z`).toISOString()
+    : (row.created_at || new Date().toISOString());
+
+  return {
+    id: String(row.id),
+    steps: Math.max(0, Math.round(Number(row.steps) || 0)),
+    exerciseMin: Math.max(0, Math.round(Number(row.exercise_minutes) || 0)),
+    exerciseSessions: Math.max(0, Math.round(Number(row.exercise_sessions) || 0)),
+    activityDate: row.activity_date || undefined,
+    caloriesBurned: Math.round((Math.max(0, Number(row.steps) || 0) * 0.04) + (Math.max(0, Number(row.exercise_minutes) || 0) * 6)),
+    activityType: 'Daily Activity',
+    source: 'Manual',
+    loggedAt: dateStr,
+  };
+}
+
+let coachMessagesStore: WLCoachMessage[] = [];
+
+export type WLTargetPaceDb = 'Slow' | 'Steady' | 'Moderate';
+
+/**
+ * Maps any UI target pace string (e.g. '0.5 lb / week', '1 lb / week', '1.5 lb / week', '2 lb / week',
+ * 'gentle', 'moderate', etc.) to the strict database check constraint:
+ * CHECK ((target_pace IS NULL) OR (target_pace = ANY (ARRAY['Slow'::text, 'Steady'::text, 'Moderate'::text])))
+ */
+export function mapPaceToDb(pace?: string | null): WLTargetPaceDb | null {
+  if (pace === undefined || pace === null) return null;
+  const p = pace.trim().toLowerCase();
+  if (!p) return null;
+
+  // 1. Direct exact matches for DB constraint values
+  if (p === 'slow') return 'Slow';
+  if (p === 'steady') return 'Steady';
+  if (p === 'moderate') return 'Moderate';
+
+  // 2. Map existing UI values
+  // Gentle / 0.5 lb / week -> Slow
+  if (p.includes('0.5') || p.includes('slow') || p.includes('gentle')) {
+    return 'Slow';
+  }
+  // Standard / Steady / Recommended / 1.0 lb / week -> Steady
+  if (
+    p.includes('1.0') ||
+    p.includes('1 lb') ||
+    p.includes('steady') ||
+    p.includes('standard') ||
+    p.includes('sustain')
+  ) {
+    return 'Steady';
+  }
+  // Accelerated / Intensive / Active / Fast / 1.5 lb / 2.0 lb / week -> Moderate
+  if (
+    p.includes('1.5') ||
+    p.includes('2') ||
+    p.includes('accelerat') ||
+    p.includes('intens') ||
+    p.includes('activ') ||
+    p.includes('fast') ||
+    p.includes('max') ||
+    p.includes('deficit')
+  ) {
+    return 'Moderate';
+  }
+
+  // Safe fallback to allowed constraint value
+  return 'Steady';
+}
+
+/**
+ * Converts DB values ('Slow', 'Steady', 'Moderate') to user-friendly UI pace strings.
+ */
+export function mapPaceFromDb(pace?: string | null): string {
+  if (!pace) return '1 lb / week';
+  if (pace === 'Slow') return '0.5 lb / week';
+  if (pace === 'Steady') return '1 lb / week';
+  if (pace === 'Moderate') return '1.5 lb / week';
+  return pace;
+}
+
+export class WLRepository {
+  /* ================= WEIGHT RECORDS ================= */
+
+  static async getWeightRecords(): Promise<WLWeightRecord[]> {
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('weight_records')
+      .select('id, weight_lb, recorded_at')
+      .eq('user_id', user.id)
+      .order('recorded_at', { ascending: false });
+
+    if (error) throw error;
+    return (data || []).map((row) => ({
+      id: String(row.id),
+      weightLb: Number(row.weight_lb),
+      recordedAt: row.recorded_at,
+    }));
+  }
+
+  static async addWeightRecord(weightLb: number, note?: string): Promise<WLWeightRecord> {
+    const user = await requireAuthUser();
+    const recordedAt = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('weight_records')
+      .insert({
+        user_id: user.id,
+        weight_lb: weightLb,
+        recorded_at: recordedAt,
+      })
+      .select('id, weight_lb, recorded_at')
+      .single();
+
+    if (error) throw error;
+    return {
+      id: String(data.id),
+      weightLb: Number(data.weight_lb),
+      recordedAt: data.recorded_at,
+      ...(note ? { note } : {}),
+    };
+  }
+
+  static async deleteWeightRecord(id: string): Promise<void> {
+    const user = await requireAuthUser();
+    const { error } = await supabase
+      .from('weight_records')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user.id);
+
+    if (error) throw error;
+  }
+
+  static async getLatestWeight(): Promise<WLWeightRecord | null> {
+    const records = await this.getWeightRecords();
+    return records.length > 0 ? records[0] : null;
+  }
+
+  static async get7DayWeightAverage(): Promise<number | null> {
+    const records = await this.getWeightRecords();
+    if (records.length < 2) return null;
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const recent = records.filter((r) => new Date(r.recordedAt) >= sevenDaysAgo);
+    if (recent.length === 0) return null;
+    const sum = recent.reduce((acc, r) => acc + r.weightLb, 0);
+    return parseFloat((sum / recent.length).toFixed(1));
+  }
+
+  /* ================= MEAL ENTRIES ================= */
+
+  static async getMealEntries(): Promise<WLMealEntry[]> {
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('meal_log_entries')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('recorded_at', { ascending: false });
+
+    if (error) throw error;
+    return (data || []).map(mapMealRow);
+  }
+
+  static async getTodayMeals(): Promise<WLMealEntry[]> {
+    return this.getMealsForDate(new Date());
+  }
+
+  static async getMealsForDate(date: Date | string): Promise<WLMealEntry[]> {
+    const d = new Date(date);
+    const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).toISOString();
+    const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999).toISOString();
+
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('meal_log_entries')
+      .select('*')
+      .eq('user_id', user.id)
+      .gte('recorded_at', startOfDay)
+      .lte('recorded_at', endOfDay)
+      .order('recorded_at', { ascending: false });
+
+    if (error) throw error;
+    return (data || []).map(mapMealRow);
+  }
+
+  static async addMealEntry(
+    entry: Omit<WLMealEntry, 'id' | 'loggedAt'> & { loggedAt?: string }
+  ): Promise<WLMealEntry> {
+    const user = await requireAuthUser();
+    const nowIso = new Date().toISOString();
+    const loggedAt = entry.loggedAt || nowIso;
+
+    // Validate food_name
+    if (!entry.name || !entry.name.trim()) {
+      throw new Error('Food name is required.');
+    }
+
+    const rawSource = entry.inputSource || (entry.photoUrl ? 'SCAN' : 'MANUAL');
+    const inputSourceDb = mapInputSourceToDb(rawSource);
+
+    const payload = {
+      user_id: user.id,
+      food_name: entry.name.trim(),
+      meal_type: entry.type,
+      serving: entry.serving ?? null,
+      input_source: inputSourceDb,
+      calories: Math.max(0, Math.round(Number(entry.calories) || 0)),
+      protein_g: Math.max(0, Math.round(Number(entry.proteinG) || 0)),
+      carbs_g: Math.max(0, Math.round(Number(entry.carbsG) || 0)),
+      fat_g: Math.max(0, Math.round(Number(entry.fatG) || 0)),
+      fiber_g: entry.fiberG !== undefined && entry.fiberG !== null && !isNaN(Number(entry.fiberG))
+        ? Math.max(0, Math.round(Number(entry.fiberG)))
+        : null,
+      nutrition_score: entry.nutritionScore !== undefined && entry.nutritionScore !== null && !isNaN(Number(entry.nutritionScore))
+        ? Math.round(Number(entry.nutritionScore))
+        : null,
+      score_label: entry.nutritionScoreLabel ?? null,
+      health_classification: entry.aiChoiceStatus ?? null,
+      ai_insight: entry.aiInsight ?? null,
+      ai_note: entry.aiNote || null,
+      ai_suggestions: Array.isArray(entry.recommendations) ? entry.recommendations : [],
+      recorded_at: loggedAt,
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+
+    const { data, error } = await supabase
+      .from('meal_log_entries')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    this.clearPeriodHabitsCache();
+    return mapMealRow(data);
+  }
+
+  static async deleteMealEntry(id: string): Promise<void> {
+    const user = await requireAuthUser();
+    const { error } = await supabase
+      .from('meal_log_entries')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user.id);
+
+    if (error) throw error;
+    this.clearPeriodHabitsCache();
+  }
+
+  static async getTodayNutritionSummary(targetKcal = 1800): Promise<WLDailyNutritionSummary> {
+    return this.getNutritionSummaryForDate(new Date(), targetKcal);
+  }
+
+  static async getNutritionSummaryForDate(
+    date: Date | string,
+    targetKcal = 1800
+  ): Promise<WLDailyNutritionSummary> {
+    const [dateMeals, waterL] = await Promise.all([
+      this.getMealsForDate(date),
+      this.getWaterForDate(date),
+    ]);
+
+    const calories = dateMeals.reduce((acc, m) => acc + (m.calories || 0), 0);
+    const proteinG = dateMeals.reduce((acc, m) => acc + (m.proteinG || 0), 0);
+    const carbsG = dateMeals.reduce((acc, m) => acc + (m.carbsG || 0), 0);
+    const fatG = dateMeals.reduce((acc, m) => acc + (m.fatG || 0), 0);
+    const fiberG = dateMeals.reduce((acc, m) => acc + (m.fiberG || 0), 0);
+    const remainingCalories = Math.max(0, targetKcal - calories);
+    const analysesCount = dateMeals.filter(
+      (m) => m.aiStatus === 'AI complete' || m.nutritionScore !== undefined || !!m.aiInsight
+    ).length;
+
+    return {
+      calories,
+      proteinG,
+      carbsG,
+      fatG,
+      fiberG,
+      waterL,
+      analysesCount,
+      remainingCalories,
+    };
+  }
+
+  /* ================= WATER RECORDS ================= */
+
+  static async getWaterRecords(): Promise<WLWaterRecord[]> {
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('water_records')
+      .select('id, amount_ml, recorded_at')
+      .eq('user_id', user.id)
+      .order('recorded_at', { ascending: false });
+
+    if (error) throw error;
+    return (data || []).map((r) => ({
+      id: String(r.id),
+      amountL: parseFloat(((Number(r.amount_ml) || 0) / 1000).toFixed(3)),
+      loggedAt: r.recorded_at,
+    }));
+  }
+
+  static async getTodayWaterL(): Promise<number> {
+    return this.getWaterForDate(new Date());
+  }
+
+  static async getWaterForDate(date: Date | string): Promise<number> {
+    const d = new Date(date);
+    const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).toISOString();
+    const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999).toISOString();
+
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('water_records')
+      .select('amount_ml')
+      .eq('user_id', user.id)
+      .gte('recorded_at', startOfDay)
+      .lte('recorded_at', endOfDay);
+
+    if (error) throw error;
+    const totalMl = (data || []).reduce((acc, r) => acc + Number(r.amount_ml || 0), 0);
+    return parseFloat((totalMl / 1000).toFixed(2));
+  }
+
+  static async addWater(amountL: number): Promise<WLWaterRecord> {
+    const user = await requireAuthUser();
+    const recordedAt = new Date().toISOString();
+    const amountMl = Math.round(amountL * 1000);
+    const { data, error } = await supabase
+      .from('water_records')
+      .insert({
+        user_id: user.id,
+        amount_ml: amountMl,
+        recorded_at: recordedAt,
+      })
+      .select('id, amount_ml, recorded_at')
+      .single();
+
+    if (error) throw error;
+    this.clearPeriodHabitsCache();
+    return {
+      id: String(data.id),
+      amountL: parseFloat(((Number(data.amount_ml) || 0) / 1000).toFixed(3)),
+      loggedAt: data.recorded_at,
+    };
+  }
+
+  static async clearTodayWater(): Promise<void> {
+    const d = new Date();
+    const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).toISOString();
+    const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999).toISOString();
+
+    const user = await requireAuthUser();
+    const { error } = await supabase
+      .from('water_records')
+      .delete()
+      .eq('user_id', user.id)
+      .gte('recorded_at', startOfDay)
+      .lte('recorded_at', endOfDay);
+
+    if (error) throw error;
+    this.clearPeriodHabitsCache();
+  }
+
+  /* ================= ACTIVITY RECORDS ================= */
+
+  static async getActivityRecords(): Promise<WLActivityRecord[]> {
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('activity_daily_records')
+      .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions, created_at, updated_at')
+      .eq('user_id', user.id)
+      .order('activity_date', { ascending: false });
+
+    if (error) throw error;
+    return (data || []).map(mapActivityRow);
+  }
+
+  static async getTodayActivity(): Promise<{
+    steps: number;
+    exerciseMin: number;
+    exerciseSessions: number;
+    caloriesBurned: number;
+    activityRecordId?: string;
+  }> {
+    const today = getLocalDateString();
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('activity_daily_records')
+      .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions')
+      .eq('user_id', user.id)
+      .eq('activity_date', today);
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
+      return {
+        steps: 0,
+        exerciseMin: 0,
+        exerciseSessions: 0,
+        caloriesBurned: 0,
+      };
+    }
+
+    const firstRow = data[0];
+    const steps = (data || []).reduce((acc, r) => acc + Math.max(0, Math.round(Number(r.steps) || 0)), 0);
+    const exerciseMin = (data || []).reduce((acc, r) => acc + Math.max(0, Math.round(Number(r.exercise_minutes) || 0)), 0);
+    const exerciseSessions = (data || []).reduce((acc, r) => acc + Math.max(0, Math.round(Number(r.exercise_sessions) || 0)), 0);
+    const caloriesBurned = Math.round(steps * 0.04 + exerciseMin * 6);
+
+    return {
+      steps,
+      exerciseMin,
+      exerciseSessions,
+      caloriesBurned,
+      activityRecordId: firstRow?.id ? String(firstRow.id) : undefined,
+    };
+  }
+
+  static async saveTodayActivity(payload: {
+    steps: number;
+    exerciseMin?: number;
+    exerciseSessions?: number;
+    activityDate?: string;
+  }): Promise<WLActivityRecord> {
+    const user = await requireAuthUser();
+    const dateToSave = payload.activityDate || getLocalDateString();
+    const cleanSteps = Math.max(0, Math.round(Number(payload.steps) || 0));
+    const cleanMinutes = Math.max(0, Math.round(Number(payload.exerciseMin) || 0));
+    const cleanSessions = Math.max(0, Math.round(Number(payload.exerciseSessions) || 0));
+    const nowIso = new Date().toISOString();
+
+    // Safe frontend check: Check if a record already exists for today
+    const { data: existingRows, error: findError } = await supabase
+      .from('activity_daily_records')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('activity_date', dateToSave)
+      .limit(1);
+
+    if (findError) throw findError;
+
+    if (existingRows && existingRows.length > 0) {
+      // Update existing row
+      const existingId = existingRows[0].id;
+      const { data: updatedData, error: updateError } = await supabase
+        .from('activity_daily_records')
+        .update({
+          steps: cleanSteps,
+          exercise_minutes: cleanMinutes,
+          exercise_sessions: cleanSessions,
+          updated_at: nowIso,
+        })
+        .eq('id', existingId)
+        .eq('user_id', user.id)
+        .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions, created_at, updated_at')
+        .single();
+
+      if (updateError) throw updateError;
+      return mapActivityRow(updatedData);
+    } else {
+      // Insert new row
+      const { data: insertedData, error: insertError } = await supabase
+        .from('activity_daily_records')
+        .insert({
+          user_id: user.id,
+          activity_date: dateToSave,
+          steps: cleanSteps,
+          exercise_minutes: cleanMinutes,
+          exercise_sessions: cleanSessions,
+          created_at: nowIso,
+          updated_at: nowIso,
+        })
+        .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions, created_at, updated_at')
+        .single();
+
+      if (insertError) throw insertError;
+      return mapActivityRow(insertedData);
+    }
+  }
+
+  static async addActivityRecord(
+    activity: Omit<WLActivityRecord, 'id' | 'loggedAt'> & { loggedAt?: string }
+  ): Promise<WLActivityRecord> {
+    const user = await requireAuthUser();
+    const loggedAt = activity.loggedAt || new Date().toISOString();
+    const activityDate = getLocalDateString(loggedAt);
+    const cleanSteps = Math.max(0, Math.round(Number(activity.steps) || 0));
+    const cleanMinutes = Math.max(0, Math.round(Number(activity.exerciseMin) || 0));
+    const cleanSessions = Math.max(0, Math.round(Number(activity.exerciseSessions) || 0));
+    const nowIso = new Date().toISOString();
+
+    // Check if a row already exists for this date to safely add or update
+    const { data: existingRows, error: findError } = await supabase
+      .from('activity_daily_records')
+      .select('id, steps, exercise_minutes, exercise_sessions')
+      .eq('user_id', user.id)
+      .eq('activity_date', activityDate)
+      .limit(1);
+
+    if (findError) throw findError;
+
+    if (existingRows && existingRows.length > 0) {
+      const existing = existingRows[0];
+      const newSteps = (Number(existing.steps) || 0) + cleanSteps;
+      const newMinutes = (Number(existing.exercise_minutes) || 0) + cleanMinutes;
+      const newSessions = (Number(existing.exercise_sessions) || 0) + (cleanSessions || (cleanMinutes > 0 || cleanSteps > 0 ? 1 : 0));
+
+      const { data: updatedData, error: updateError } = await supabase
+        .from('activity_daily_records')
+        .update({
+          steps: Math.max(0, Math.round(newSteps)),
+          exercise_minutes: Math.max(0, Math.round(newMinutes)),
+          exercise_sessions: Math.max(0, Math.round(newSessions)),
+          updated_at: nowIso,
+        })
+        .eq('id', existing.id)
+        .eq('user_id', user.id)
+        .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions, created_at, updated_at')
+        .single();
+
+      if (updateError) throw updateError;
+      this.clearPeriodHabitsCache();
+      return mapActivityRow(updatedData);
+    } else {
+      const { data: insertedData, error: insertError } = await supabase
+        .from('activity_daily_records')
+        .insert({
+          user_id: user.id,
+          activity_date: activityDate,
+          steps: cleanSteps,
+          exercise_minutes: cleanMinutes,
+          exercise_sessions: cleanSessions || (cleanMinutes > 0 || cleanSteps > 0 ? 1 : 0),
+          created_at: nowIso,
+          updated_at: nowIso,
+        })
+        .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions, created_at, updated_at')
+        .single();
+
+      if (insertError) throw insertError;
+      this.clearPeriodHabitsCache();
+      return mapActivityRow(insertedData);
+    }
+  }
+
+  /* ================= GOALS & HABITS ================= */
+
+  static async getGoals(): Promise<WLGoal> {
+    const user = await requireAuthUser();
+    const { data, error } = await supabase
+      .from('weight_loss_profiles')
+      .select('*')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return {
+        currentWeightLb: 0,
+        goalWeightLb: 0,
+        startWeightLb: 0,
+        targetPace: '1 lb / week',
+        dailyStepGoal: 8500,
+        dailyWaterGoalL: 2.5,
+        dailyCalorieGoalKcal: 1800,
+        dailyProteinGoalG: 120,
+        dailyCarbsGoalG: 200,
+        dailyFatGoalG: 60,
+        dailyFiberGoalG: 28,
+        dietaryPreferences: [],
+        healthyHabits: [
+          { id: 'h_1', title: 'Drink a glass of water before breakfast', completed: false },
+          { id: 'h_2', title: 'Aim for 30g protein at first meal', completed: false },
+          { id: 'h_3', title: '15-min post-dinner walk', completed: false },
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
+    return {
+      currentWeightLb: data.current_weight_lb !== null && data.current_weight_lb !== undefined ? Number(data.current_weight_lb) : 0,
+      goalWeightLb: data.goal_weight_lb !== null && data.goal_weight_lb !== undefined ? Number(data.goal_weight_lb) : 0,
+      startWeightLb: Number(data.current_weight_lb) || 0,
+      targetPace: mapPaceFromDb(data.target_pace),
+      dailyStepGoal: data.daily_step_target ? Number(data.daily_step_target) : 8500,
+      dailyWaterGoalL: data.daily_water_target_ml ? parseFloat((Number(data.daily_water_target_ml) / 1000).toFixed(2)) : 2.5,
+      dailyCalorieGoalKcal: data.daily_calorie_target ? Number(data.daily_calorie_target) : 1800,
+      dailyProteinGoalG: data.daily_protein_target_g ? Number(data.daily_protein_target_g) : 120,
+      dailyCarbsGoalG: data.daily_carb_target_g ? Number(data.daily_carb_target_g) : 200,
+      dailyFatGoalG: data.daily_fat_target_g ? Number(data.daily_fat_target_g) : 60,
+      dailyFiberGoalG: data.daily_fiber_target_g ? Number(data.daily_fiber_target_g) : 28,
+      dietaryPreferences: Array.isArray(data.food_preferences) ? data.food_preferences : [],
+      healthyHabits: [
+        { id: 'h_1', title: 'Drink a glass of water before breakfast', completed: false },
+        { id: 'h_2', title: 'Aim for 30g protein at first meal', completed: false },
+        { id: 'h_3', title: '15-min post-dinner walk', completed: false },
+      ],
+      updatedAt: data.updated_at || new Date().toISOString(),
+    };
+  }
+
+  static async updateGoals(goal: Partial<WLGoal>): Promise<WLGoal> {
+    const user = await requireAuthUser();
+    const profileUpdates: Record<string, any> = {
+      updated_at: new Date().toISOString(),
+    };
+    if (goal.currentWeightLb !== undefined) profileUpdates.current_weight_lb = goal.currentWeightLb;
+    if (goal.goalWeightLb !== undefined) profileUpdates.goal_weight_lb = goal.goalWeightLb;
+    if (goal.targetPace !== undefined) profileUpdates.target_pace = mapPaceToDb(goal.targetPace);
+    if (goal.dailyCalorieGoalKcal !== undefined)
+      profileUpdates.daily_calorie_target = Math.round(goal.dailyCalorieGoalKcal);
+    if (goal.dailyProteinGoalG !== undefined)
+      profileUpdates.daily_protein_target_g = Math.round(goal.dailyProteinGoalG);
+    if (goal.dailyCarbsGoalG !== undefined)
+      profileUpdates.daily_carb_target_g = Math.round(goal.dailyCarbsGoalG);
+    if (goal.dailyFatGoalG !== undefined)
+      profileUpdates.daily_fat_target_g = Math.round(goal.dailyFatGoalG);
+    if (goal.dailyFiberGoalG !== undefined)
+      profileUpdates.daily_fiber_target_g = Math.round(goal.dailyFiberGoalG);
+    if (goal.dailyWaterGoalL !== undefined)
+      profileUpdates.daily_water_target_ml = Math.round(goal.dailyWaterGoalL * 1000);
+    if (goal.dailyStepGoal !== undefined)
+      profileUpdates.daily_step_target = Math.round(goal.dailyStepGoal);
+    if (goal.dietaryPreferences !== undefined)
+      profileUpdates.food_preferences = goal.dietaryPreferences;
+
+    const payload = { user_id: user.id, ...profileUpdates };
+
+    const { error } = await supabase
+      .from('weight_loss_profiles')
+      .upsert(payload, { onConflict: 'user_id' });
+
+    if (error) throw error;
+
+    const goals = await this.getGoals();
+    return {
+      ...goals,
+      healthyHabits: goal.healthyHabits ?? goals.healthyHabits,
+    };
+  }
+
+  /* ================= COACH MESSAGES ================= */
+
+  static async getCoachMessages(conversationId?: string): Promise<WLCoachMessage[]> {
+    try {
+      const user = await requireAuthUser();
+      let query = supabase
+        .from('ai_coach_messages')
+        .select('id, user_id, conversation_id, role, content, created_at')
+        .eq('user_id', user.id);
+
+      if (conversationId) {
+        query = query.eq('conversation_id', conversationId);
+      }
+
+      const { data, error } = await query.order('created_at', { ascending: true });
+
+      if (error) {
+        // If table does not exist in schema cache or permissions not yet run, bubble or fallback gracefully
+        console.warn('WLRepository.getCoachMessages Supabase query warning:', error.message || error);
+        throw error;
+      }
+
+      if (data && data.length > 0) {
+        const persistedMessages: WLCoachMessage[] = data.map((row) => {
+          const createdAtDate = row.created_at ? new Date(row.created_at) : new Date();
+          return {
+            id: String(row.id),
+            sender: row.role === 'assistant' || row.role === 'ai' ? 'ai' : 'user',
+            text: row.content || '',
+            timestamp: !isNaN(createdAtDate.getTime())
+              ? createdAtDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+              : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            userId: row.user_id,
+            conversationId: row.conversation_id,
+            createdAt: row.created_at,
+          };
+        });
+        // Update in-memory store for instantaneous returns
+        coachMessagesStore = persistedMessages;
+        return persistedMessages;
+      }
+
+      return [...coachMessagesStore];
+    } catch (err) {
+      console.warn('WLRepository.getCoachMessages fetch failed, returning in-memory store:', err);
+      // If network or table is missing, preserve memory and rethrow if caller handles or return memory
+      if (coachMessagesStore.length > 0) {
+        return [...coachMessagesStore];
+      }
+      throw err;
+    }
+  }
+
+  static async addCoachMessage(
+    sender: 'ai' | 'user',
+    text: string,
+    conversationId: string = 'weight_loss_default'
+  ): Promise<WLCoachMessage> {
+    const clientGeneratedId = `wl_msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const nowIso = new Date().toISOString();
+    const newMsg: WLCoachMessage = {
+      id: clientGeneratedId,
+      sender,
+      text,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      conversationId,
+      createdAt: nowIso,
+    };
+
+    // Keep client-side state synchronized immediately
+    coachMessagesStore.push(newMsg);
+
+    try {
+      const user = await requireAuthUser();
+      newMsg.userId = user.id;
+
+      const role = sender === 'ai' ? 'assistant' : 'user';
+      const { data, error } = await supabase
+        .from('ai_coach_messages')
+        .insert({
+          user_id: user.id,
+          conversation_id: conversationId,
+          role,
+          content: text,
+          created_at: nowIso,
+        })
+        .select('id, user_id, conversation_id, role, content, created_at')
+        .single();
+
+      if (error) {
+        console.warn('WLRepository.addCoachMessage Supabase insert error:', error.message || error);
+        throw error;
+      }
+
+      if (data) {
+        newMsg.id = String(data.id);
+        newMsg.createdAt = data.created_at;
+        // Update the item in the store with DB generated id
+        const idx = coachMessagesStore.findIndex((m) => m.id === clientGeneratedId);
+        if (idx !== -1) {
+          coachMessagesStore[idx] = newMsg;
+        }
+      }
+    } catch (dbErr) {
+      console.warn('WLRepository.addCoachMessage persistence error:', dbErr);
+      throw dbErr;
+    }
+
+    return newMsg;
+  }
+
+  static async clearCoachMessages(conversationId: string = 'weight_loss_default'): Promise<void> {
+    coachMessagesStore = [];
+    try {
+      const user = await requireAuthUser();
+      const { error } = await supabase
+        .from('ai_coach_messages')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('conversation_id', conversationId);
+
+      if (error) {
+        console.warn('WLRepository.clearCoachMessages Supabase delete error:', error.message || error);
+        throw error;
+      }
+    } catch (err) {
+      console.warn('WLRepository.clearCoachMessages warning:', err);
+      throw err;
+    }
+  }
+
+  /* ================= DASHBOARD CACHE & DATA ================= */
+  private static cachedDashboard: WLDashboardData | null = null;
+
+  static getCachedDashboard(): WLDashboardData | null {
+    return this.cachedDashboard;
+  }
+
+  static setCachedDashboard(data: WLDashboardData): void {
+    this.cachedDashboard = data;
+  }
+
+  static async fetchDashboardData(calorieGoalKcal: number): Promise<WLDashboardData> {
+    const [weightRes, mealsRes, waterRes, activityRes, summaryRes] = await Promise.allSettled([
+      this.getLatestWeight(),
+      this.getTodayMeals(),
+      this.getTodayWaterL(),
+      this.getTodayActivity(),
+      this.getTodayNutritionSummary(calorieGoalKcal),
+    ]);
+
+    const prev = this.cachedDashboard;
+
+    const latestWeightRecord =
+      weightRes.status === 'fulfilled'
+        ? weightRes.value
+        : (prev ? prev.latestWeightRecord : null);
+
+    const todayMeals =
+      mealsRes.status === 'fulfilled'
+        ? mealsRes.value
+        : (prev ? prev.todayMeals : []);
+
+    const todayWater =
+      waterRes.status === 'fulfilled'
+        ? waterRes.value
+        : (prev ? prev.todayWater : 0);
+
+    const todayActivity =
+      activityRes.status === 'fulfilled'
+        ? activityRes.value
+        : (prev ? prev.todayActivity : { steps: 0, exerciseMin: 0, caloriesBurned: 0 });
+
+    const nutritionSummary =
+      summaryRes.status === 'fulfilled'
+        ? summaryRes.value
+        : (prev ? prev.nutritionSummary : {
+            calories: 0,
+            proteinG: 0,
+            carbsG: 0,
+            fatG: 0,
+            fiberG: 0,
+            waterL: 0,
+            analysesCount: 0,
+            remainingCalories: calorieGoalKcal,
+          });
+
+    const result: WLDashboardData = {
+      latestWeightRecord,
+      todayMeals,
+      todayWater,
+      todayActivity,
+      nutritionSummary,
+      isInitialLoaded: true,
+    };
+
+    this.cachedDashboard = result;
+    return result;
+  }
+
+  /* ================= PERIOD HABIT CALCULATIONS ================= */
+
+  private static periodHabitsCache = new Map<string, { metrics: WLPeriodHabitMetrics; timestamp: number }>();
+
+  static clearPeriodHabitsCache(): void {
+    this.periodHabitsCache.clear();
+  }
+
+  /**
+   * Computes the exact local calendar date range and day count for the given period:
+   * - 'week': current local calendar week, Monday through today.
+   * - '30d': today and the preceding 29 local calendar days (30 days total).
+   * - '90d': today and the preceding 89 local calendar days (90 days total).
+   */
+  static getPeriodDateRange(period: WLProgressPeriod, now: Date = new Date()): WLPeriodDateRange {
+    const year = now.getFullYear();
+    const month = now.getMonth();
+    const date = now.getDate();
+
+    const todayStart = new Date(year, month, date, 0, 0, 0, 0);
+    const todayEnd = new Date(year, month, date, 23, 59, 59, 999);
+    const todayStr = getLocalDateString(todayStart);
+
+    if (period === 'week') {
+      // Current local calendar week: Monday through today
+      const dayOfWeek = todayStart.getDay(); // 0 is Sunday, 1 is Monday, ..., 6 is Saturday
+      const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+      const monday = new Date(todayStart);
+      monday.setDate(todayStart.getDate() + diffToMonday);
+      monday.setHours(0, 0, 0, 0);
+
+      const dayCount = dayOfWeek === 0 ? 7 : dayOfWeek;
+
+      return {
+        period,
+        startDate: monday,
+        endDate: todayEnd,
+        startDateStr: getLocalDateString(monday),
+        endDateStr: todayStr,
+        dayCount,
+      };
+    }
+
+    if (period === '30d') {
+      // Today and preceding 29 local calendar days = 30 days total
+      const startDate = new Date(todayStart);
+      startDate.setDate(todayStart.getDate() - 29);
+      startDate.setHours(0, 0, 0, 0);
+
+      return {
+        period,
+        startDate,
+        endDate: todayEnd,
+        startDateStr: getLocalDateString(startDate),
+        endDateStr: todayStr,
+        dayCount: 30,
+      };
+    }
+
+    // 90d: Today and preceding 89 local calendar days = 90 days total
+    const startDate = new Date(todayStart);
+    startDate.setDate(todayStart.getDate() - 89);
+    startDate.setHours(0, 0, 0, 0);
+
+    return {
+      period,
+      startDate,
+      endDate: todayEnd,
+      startDateStr: getLocalDateString(startDate),
+      endDateStr: todayStr,
+      dayCount: 90,
+    };
+  }
+
+  /**
+   * Fetches authentic records from Supabase strictly bounded by the period's date range,
+   * calculates period habit metrics, and caches the result by period key.
+   *
+   * Database verification:
+   * - meal_log_entries: uses recorded_at (TIMESTAMPTZ)
+   * - water_records: uses recorded_at (TIMESTAMPTZ)
+   * - activity_daily_records: uses activity_date (DATE 'YYYY-MM-DD')
+   * - User isolation: strictly filters to authenticated user_id
+   * - No demo fallbacks when empty (returns exact 0 averages)
+   */
+  static async fetchPeriodHabits(
+    period: WLProgressPeriod,
+    now: Date = new Date()
+  ): Promise<WLPeriodHabitMetrics> {
+    const range = this.getPeriodDateRange(period, now);
+    const cacheKey = `${period}_${range.startDateStr}_${range.endDateStr}_${range.dayCount}`;
+
+    const cached = this.periodHabitsCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 30_000) {
+      return cached.metrics;
+    }
+
+    const user = await requireAuthUser();
+
+    // 1. Query public.meal_log_entries for authenticated user within [startDate, endDate]
+    const { data: mealRows, error: mealErr } = await supabase
+      .from('meal_log_entries')
+      .select('id, food_name, meal_type, calories, protein_g, carbs_g, fat_g, recorded_at')
+      .eq('user_id', user.id)
+      .gte('recorded_at', range.startDate.toISOString())
+      .lte('recorded_at', range.endDate.toISOString())
+      .order('recorded_at', { ascending: false });
+
+    if (mealErr) throw mealErr;
+
+    // 2. Query public.water_records for authenticated user within [startDate, endDate]
+    const { data: waterRows, error: waterErr } = await supabase
+      .from('water_records')
+      .select('id, amount_ml, recorded_at')
+      .eq('user_id', user.id)
+      .gte('recorded_at', range.startDate.toISOString())
+      .lte('recorded_at', range.endDate.toISOString())
+      .order('recorded_at', { ascending: false });
+
+    if (waterErr) throw waterErr;
+
+    // 3. Query public.activity_daily_records for authenticated user within [startDateStr, endDateStr]
+    const { data: activityRows, error: actErr } = await supabase
+      .from('activity_daily_records')
+      .select('id, user_id, activity_date, steps, exercise_minutes, exercise_sessions')
+      .eq('user_id', user.id)
+      .gte('activity_date', range.startDateStr)
+      .lte('activity_date', range.endDateStr)
+      .order('activity_date', { ascending: false });
+
+    if (actErr) throw actErr;
+
+    const meals: WLMealEntry[] = (mealRows || []).map(mapMealRow);
+    const water: WLWaterRecord[] = (waterRows || []).map((r) => ({
+      id: String(r.id),
+      amountL: parseFloat(((Number(r.amount_ml) || 0) / 1000).toFixed(3)),
+      loggedAt: r.recorded_at,
+    }));
+    const activities: WLActivityRecord[] = (activityRows || []).map(mapActivityRow);
+
+    const metrics = this.calculatePeriodHabits(period, meals, water, activities, now);
+    this.periodHabitsCache.set(cacheKey, { metrics, timestamp: Date.now() });
+    return metrics;
+  }
+
+  /**
+   * Calculates the true period-wide daily habit averages:
+   * - Calories: total calories logged divided by the period's day count.
+   * - Protein: total protein (g) logged divided by the period's day count.
+   * - Water: total water recorded divided by the period's day count.
+   * - Steps: total steps recorded divided by the period's day count.
+   */
+  static calculatePeriodHabits(
+    period: WLProgressPeriod,
+    meals: WLMealEntry[],
+    water: WLWaterRecord[],
+    activities: WLActivityRecord[],
+    now: Date = new Date()
+  ): WLPeriodHabitMetrics {
+    const range = this.getPeriodDateRange(period, now);
+
+    // 1. Calories & Protein: Filter meal entries strictly within the local calendar date range
+    const periodMeals = meals.filter((m) => {
+      const dStr = getLocalDateString(m.loggedAt);
+      return dStr >= range.startDateStr && dStr <= range.endDateStr;
+    });
+
+    const totalCalories = periodMeals.reduce((acc, m) => acc + Math.max(0, Number(m.calories) || 0), 0);
+    const totalProtein = periodMeals.reduce((acc, m) => acc + Math.max(0, Number(m.proteinG) || 0), 0);
+
+    const avgCalories = range.dayCount > 0 ? Math.round(totalCalories / range.dayCount) : 0;
+    const avgProtein = range.dayCount > 0 ? Math.round(totalProtein / range.dayCount) : 0;
+
+    // 2. Water: Filter water records within the range & sum per local calendar day
+    const periodWater = water.filter((w) => {
+      const dStr = getLocalDateString(w.loggedAt);
+      return dStr >= range.startDateStr && dStr <= range.endDateStr;
+    });
+
+    const dailyWaterMap = new Map<string, number>();
+    for (const w of periodWater) {
+      const dStr = getLocalDateString(w.loggedAt);
+      dailyWaterMap.set(dStr, (dailyWaterMap.get(dStr) || 0) + Math.max(0, Number(w.amountL) || 0));
+    }
+
+    let totalWaterL = 0;
+    for (const amount of dailyWaterMap.values()) {
+      totalWaterL += amount;
+    }
+    const avgWater = range.dayCount > 0 ? parseFloat((totalWaterL / range.dayCount).toFixed(1)) : 0;
+
+    // 3. Steps: Filter activity records within range & sum per local calendar day
+    const periodActivities = activities.filter((a) => {
+      const dStr = getLocalDateString(a.activityDate || a.loggedAt);
+      return dStr >= range.startDateStr && dStr <= range.endDateStr;
+    });
+
+    const dailyStepsMap = new Map<string, number>();
+    for (const a of periodActivities) {
+      const dStr = getLocalDateString(a.activityDate || a.loggedAt);
+      dailyStepsMap.set(dStr, (dailyStepsMap.get(dStr) || 0) + Math.max(0, Number(a.steps) || 0));
+    }
+
+    let totalSteps = 0;
+    for (const steps of dailyStepsMap.values()) {
+      totalSteps += steps;
+    }
+    const avgSteps = range.dayCount > 0 ? Math.round(totalSteps / range.dayCount) : 0;
+
+    // Development-only diagnostic logging
+    console.log('[WLHabits Diagnostic]', {
+      selectedPeriod: period,
+      rangeStartDate: range.startDateStr,
+      rangeEndDate: range.endDateStr,
+      daysInRange: range.dayCount,
+      mealRecordsFetched: periodMeals.length,
+      waterRecordsFetched: periodWater.length,
+      activityRecordsFetched: periodActivities.length,
+      calculatedMetrics: {
+        avgCalories,
+        avgProtein,
+        avgWater,
+        avgSteps,
+      },
+    });
+
+    return {
+      avgCalories,
+      avgProtein,
+      avgWater,
+      avgSteps,
+      totalCalories,
+      totalProtein,
+      totalWaterL,
+      totalSteps,
+      mealCount: periodMeals.length,
+      waterCount: periodWater.length,
+      activityCount: periodActivities.length,
+      range,
+    };
+  }
+}
+

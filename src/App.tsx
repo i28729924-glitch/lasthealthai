@@ -1,0 +1,579 @@
+import { useState, useEffect } from 'react';
+import { Shield, Droplet, Scale, Sparkles } from 'lucide-react';
+import { BottomTab, ActiveModule, UserSharedProfile, WeightLossSettings } from './types';
+import { BottomNavigation } from './components/BottomNavigation';
+import { WLHome } from './weight-loss/home/WLHome';
+import { WLHistory } from './weight-loss/history/WLHistory';
+import { WLProgress } from './weight-loss/progress/WLProgress';
+import { WLCoach } from './weight-loss/coach/WLCoach';
+import { WLProfile } from './weight-loss/profile/WLProfile';
+import { WLRepository } from './weight-loss/data/WLRepository';
+import { WLDashboardData } from './weight-loss/data/WLTypes';
+import { ProfileScreen, calculateAge } from './profile/ProfileScreen';
+import { CancerHomeScreen } from './cancer-awareness/home/CancerHomeScreen';
+import { CancerHistoryScreen } from './cancer-awareness/history/CancerHistoryScreen';
+import { CancerProgressScreen } from './cancer-awareness/progress/CancerProgressScreen';
+import { CancerCoachScreen } from './cancer-awareness/coach/CancerCoachScreen';
+import { CancerAwarenessSettings } from './cancer-awareness/types';
+import { DiabetesHomeScreen } from './diabetes-awareness/home/DiabetesHomeScreen';
+import { DiabetesHistoryScreen } from './diabetes-awareness/history/DiabetesHistoryScreen';
+import { DiabetesProgressScreen } from './diabetes-awareness/progress/DiabetesProgressScreen';
+import { DiabetesCoachScreen } from './diabetes-awareness/coach/DiabetesCoachScreen';
+import { DiabetesAwarenessSettings } from './diabetes-awareness/types';
+import { OnboardingFlow } from './onboarding/OnboardingFlow';
+import { OnboardingRepository } from './onboarding/OnboardingRepository';
+import { OnboardingData } from './onboarding/OnboardingTypes';
+import { Session } from '@supabase/supabase-js';
+import { supabase } from './core/supabase';
+import { ProfileRepository } from './core/profile';
+import { AuthScreen } from './auth/AuthScreen';
+
+const ACTIVE_MODULE_STORAGE_KEY = 'vita_active_module';
+const THREE_MODULES_SUB_STORAGE_KEY = 'vita_three_modules_sub';
+
+export function getPersistedActiveModule(): ActiveModule {
+  try {
+    const saved = localStorage.getItem(ACTIVE_MODULE_STORAGE_KEY) as ActiveModule | null;
+    if (
+      saved === 'cancer_awareness' ||
+      saved === 'diabetes_awareness' ||
+      saved === 'weight_loss' ||
+      saved === 'nutrition'
+    ) {
+      return saved;
+    }
+  } catch {
+    // Storage access fallback
+  }
+  return 'cancer_awareness';
+}
+
+export function getPersistedThreeModulesSub(): 'weight_loss' | 'cancer_awareness' | 'diabetes_awareness' {
+  try {
+    const activeSaved = localStorage.getItem(ACTIVE_MODULE_STORAGE_KEY);
+    if (activeSaved === 'cancer_awareness' || activeSaved === 'diabetes_awareness') {
+      return activeSaved;
+    }
+    const saved = localStorage.getItem(THREE_MODULES_SUB_STORAGE_KEY);
+    if (saved === 'cancer_awareness' || saved === 'diabetes_awareness' || saved === 'weight_loss') {
+      return saved;
+    }
+  } catch {
+    // Storage access fallback
+  }
+  return 'weight_loss';
+}
+
+export function persistActiveModule(mod: ActiveModule): void {
+  try {
+    const normalizedMod = mod === '3_modules' ? 'three_modules' : mod;
+    localStorage.setItem(ACTIVE_MODULE_STORAGE_KEY, normalizedMod);
+  } catch {
+    // Storage access fallback
+  }
+}
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<BottomTab>('home');
+  const [activeModule, setActiveModule] = useState<ActiveModule>(getPersistedActiveModule);
+  const [threeModulesSub, setThreeModulesSub] = useState<'weight_loss' | 'cancer_awareness' | 'diabetes_awareness'>(
+    getPersistedThreeModulesSub
+  );
+  const [session, setSession] = useState<Session | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
+  const [isOnboarded, setIsOnboarded] = useState<boolean>(false);
+
+  const handleSwitchModule = (mod: ActiveModule) => {
+    const normalizedMod = mod === '3_modules' ? 'three_modules' : mod;
+    setActiveModule(normalizedMod);
+    persistActiveModule(normalizedMod);
+
+    if (normalizedMod === 'nutrition') {
+      setActiveTab('history');
+    } else {
+      setActiveTab('home');
+    }
+  };
+
+  const handleSwitchGoal = (goal: 'weight_loss' | 'cancer_awareness' | 'diabetes_awareness') => {
+    if (activeModule !== 'three_modules') {
+      setActiveModule('three_modules');
+      persistActiveModule('three_modules');
+    }
+    setThreeModulesSub(goal);
+    try {
+      localStorage.setItem(THREE_MODULES_SUB_STORAGE_KEY, goal);
+    } catch {
+      // Storage access fallback
+    }
+    setActiveTab('home');
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+    let latestRequestId = 0;
+
+    async function evaluateAuthAndOnboarding(activeSession: Session | null) {
+      const currentRequestId = ++latestRequestId;
+
+      if (!activeSession) {
+        if (isMounted && currentRequestId === latestRequestId) {
+          setSession(null);
+          setIsOnboarded(false);
+          setIsAuthLoading(false);
+        }
+        return;
+      }
+
+      if (isMounted && currentRequestId === latestRequestId) {
+        setIsAuthLoading(true);
+      }
+
+      try {
+        const completed = await OnboardingRepository.checkOnboardingCompleted(activeSession.user.id);
+        if (!isMounted || currentRequestId !== latestRequestId) return;
+
+        setSession(activeSession);
+        setIsOnboarded(completed);
+
+        if (completed) {
+          try {
+            const userProfile = await ProfileRepository.getProfile();
+            if (userProfile && isMounted && currentRequestId === latestRequestId) {
+              const computedAge = calculateAge(userProfile.dateOfBirth);
+              setSharedProfile((prev) => ({
+                ...prev,
+                fullName: userProfile.fullName || prev.fullName,
+                email: userProfile.email || prev.email,
+                dob: userProfile.dateOfBirth || prev.dob,
+                age: computedAge ?? prev.age,
+                gender: userProfile.gender || prev.gender,
+                heightCm: userProfile.heightCm || prev.heightCm,
+              }));
+            }
+          } catch {
+            // Non-critical profile synchronization
+          }
+
+          try {
+            const goals = await WLRepository.getGoals();
+            if (goals && isMounted && currentRequestId === latestRequestId) {
+              setWeightLossSettings((prev) => ({
+                ...prev,
+                currentWeightLb: goals.currentWeightLb || prev.currentWeightLb,
+                goalWeightLb: goals.goalWeightLb || prev.goalWeightLb,
+                startWeightLb: goals.startWeightLb || prev.startWeightLb,
+                targetPace: goals.targetPace || prev.targetPace,
+                dailyStepGoal: goals.dailyStepGoal || prev.dailyStepGoal,
+                dailyWaterGoalL: goals.dailyWaterGoalL || prev.dailyWaterGoalL,
+                dailyCalorieGoalKcal: goals.dailyCalorieGoalKcal || prev.dailyCalorieGoalKcal,
+                dailyProteinGoalG: goals.dailyProteinGoalG || prev.dailyProteinGoalG,
+                dailyCarbsGoalG: goals.dailyCarbsGoalG ?? prev.dailyCarbsGoalG,
+                dailyFatGoalG: goals.dailyFatGoalG ?? prev.dailyFatGoalG,
+                dailyFiberGoalG: goals.dailyFiberGoalG ?? prev.dailyFiberGoalG,
+                dietaryPreferences:
+                  goals.dietaryPreferences && goals.dietaryPreferences.length > 0
+                    ? goals.dietaryPreferences
+                    : prev.dietaryPreferences,
+                healthyHabits: goals.healthyHabits ?? prev.healthyHabits,
+              }));
+            }
+          } catch {
+            // Non-critical weight loss goals synchronization
+          }
+        }
+      } catch {
+        if (isMounted && currentRequestId === latestRequestId) {
+          setSession(activeSession);
+          setIsOnboarded(false);
+        }
+      } finally {
+        if (isMounted && currentRequestId === latestRequestId) {
+          setIsAuthLoading(false);
+        }
+      }
+    }
+
+    // 1. Initial restoration of persisted session on app launch / refresh
+    supabase.auth
+      .getSession()
+      .then(({ data: { session: initialSession }, error }) => {
+        if (!isMounted) return;
+        if (error || !initialSession) {
+          evaluateAuthAndOnboarding(null);
+        } else {
+          evaluateAuthAndOnboarding(initialSession);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          evaluateAuthAndOnboarding(null);
+        }
+      });
+
+    // 2. Listen to active auth events (SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED)
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, currentSession) => {
+      if (!isMounted) return;
+      evaluateAuthAndOnboarding(currentSession);
+    });
+
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // One shared profile across all modules (populated from public.profiles)
+  const [sharedProfile, setSharedProfile] = useState<UserSharedProfile>({
+    fullName: '',
+    email: '',
+    avatarUrl: '',
+    dob: '',
+    age: 0,
+    gender: '',
+    heightCm: 0,
+    memberSince: 'Today',
+    streakDays: 1,
+    units: 'imperial'
+  });
+
+  // Diabetes Awareness settings (isolated)
+  const [diabetesSettings, setDiabetesSettings] = useState<DiabetesAwarenessSettings>({
+    glucoseTargetRange: '70–180 mg/dL',
+    glucoseLoggingReminder: 'Daily',
+    mealLoggingReminder: 'Daily',
+    dailyWaterGoalL: 2.4,
+    dailyActivityGoalMin: 30,
+    preferredGlucoseUnits: 'mg/dL'
+  });
+
+  // Cancer Awareness settings (isolated)
+  const [cancerSettings, setCancerSettings] = useState<CancerAwarenessSettings>({
+    screeningReminders: 'Every 6 months',
+    screeningHistory: 'Not specified',
+    familyHistory: 'Not specified',
+    riskFactors: 'Not specified',
+    lifestyleGoal: 'Maintain a healthy weight',
+    reminderFrequency: 'Every 6 months'
+  });
+
+  // Weight Loss settings (isolated)
+  const [weightLossSettings, setWeightLossSettings] = useState<WeightLossSettings>({
+    currentWeightLb: 164.2,
+    goalWeightLb: 145,
+    startWeightLb: 172.5,
+    targetPace: '1 lb / week',
+    activityLevel: 'Moderate',
+    dailyStepGoal: 8500,
+    dailyWaterGoalL: 2.5,
+    dailyCalorieGoalKcal: 1850,
+    dailyProteinGoalG: 120,
+    dietaryPreferences: ['High-protein', 'Balanced']
+  });
+
+  // Cached Weight Loss dashboard data across tab switches (avoids zero-state flicker)
+  const [wlDashboardData, setWlDashboardData] = useState<WLDashboardData | null>(() =>
+    WLRepository.getCachedDashboard()
+  );
+
+  const effectiveModule =
+    activeModule === 'three_modules' || activeModule === '3_modules'
+      ? threeModulesSub
+      : activeModule;
+
+  const isThreeModulesActive = activeModule === 'three_modules' || activeModule === '3_modules';
+  const isCancerAwareness = effectiveModule === 'cancer_awareness';
+  const isDiabetesAwareness = effectiveModule === 'diabetes_awareness';
+
+  const handleOnboardingComplete = async (data: OnboardingData) => {
+    setSharedProfile((prev) => ({
+      ...prev,
+      fullName: data.fullName,
+      email: data.email,
+      dob: data.dob,
+      age: data.age,
+      gender: data.gender,
+      heightCm: data.heightCm,
+      units: data.units,
+    }));
+
+    setWeightLossSettings((prev) => ({
+      ...prev,
+      currentWeightLb: data.currentWeightLb,
+      goalWeightLb: data.goalWeightLb,
+      targetPace: data.targetPace,
+      activityLevel: data.activityLevel,
+      dailyStepGoal: data.dailyStepGoal,
+      dailyWaterGoalL: data.dailyWaterGoalL,
+      dailyCalorieGoalKcal: data.dailyCalorieGoalKcal,
+      dailyProteinGoalG: data.dailyProteinGoalG,
+      dietaryPreferences: [
+        data.dietaryPreference,
+        ...data.dietaryRestrictions.filter((r) => r !== 'None'),
+      ],
+    }));
+
+    if (data.currentWeightLb) {
+      await WLRepository.addWeightRecord(data.currentWeightLb, 'Initial weigh-in from onboarding').catch(() => {
+        // Non-blocking initial weight recording
+      });
+    }
+
+    if (data.primaryGoal === 'diabetes_awareness') {
+      handleSwitchModule('diabetes_awareness');
+    } else if (data.primaryGoal === 'cancer_awareness') {
+      handleSwitchModule('cancer_awareness');
+    } else {
+      handleSwitchModule('weight_loss');
+    }
+
+    setActiveTab('home');
+    setIsOnboarded(true);
+  };
+
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-[#E3ECF3] flex justify-center selection:bg-[#1769AA] selection:text-white">
+        <div className="w-full max-w-md bg-[#F7FAFC] min-h-screen relative shadow-2xl flex flex-col items-center justify-center border-x border-[#DCE7EE] p-6">
+          <div className="w-12 h-12 rounded-2xl bg-[#1769AA] text-white flex items-center justify-center font-black text-xl mb-3 shadow-xs animate-pulse">
+            V
+          </div>
+          <p className="text-xs font-semibold text-[#536675]">Initializing VitaAI...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-[#E3ECF3] flex justify-center selection:bg-[#1769AA] selection:text-white">
+        <div className="w-full max-w-md bg-[#F7FAFC] min-h-screen relative shadow-2xl flex flex-col border-x border-[#DCE7EE]">
+          <AuthScreen />
+        </div>
+      </div>
+    );
+  }
+
+  if (!isOnboarded) {
+    return (
+      <div className="min-h-screen bg-[#E3ECF3] flex justify-center selection:bg-[#1769AA] selection:text-white">
+        <div className="w-full max-w-md bg-[#F7FAFC] min-h-screen relative shadow-2xl flex flex-col border-x border-[#DCE7EE]">
+          <OnboardingFlow onComplete={handleOnboardingComplete} />
+        </div>
+      </div>
+    );
+  }
+
+  const getOuterBg = () => {
+    if (isDiabetesAwareness) return 'bg-[#E3ECF3]';
+    if (isCancerAwareness) return 'bg-[#EAE4EE]';
+    return 'bg-[#E7EEE9]';
+  };
+
+  const getContainerBg = () => {
+    if (isDiabetesAwareness) return 'bg-[#F7FAFC] border-[#DCE7EE]';
+    if (isCancerAwareness) return 'bg-[#F6F3F7] border-[#E4DEE9]';
+    return 'bg-[#F6FAF7] border-[#DCE6E0]';
+  };
+
+  const getSelectionColor = () => {
+    if (isDiabetesAwareness) return 'selection:bg-[#1769AA] selection:text-white';
+    if (isCancerAwareness) return 'selection:bg-[#5A3577] selection:text-white';
+    return 'selection:bg-[#1F7A5C] selection:text-white';
+  };
+
+  return (
+    <div className={`min-h-screen ${getOuterBg()} flex justify-center ${getSelectionColor()}`}>
+      {/* Mobile viewport container */}
+      <div className={`w-full max-w-md ${getContainerBg()} min-h-screen relative shadow-2xl flex flex-col border-x`}>
+        {/* 3 Modules Switcher Bar - Active when "3 Modules" is selected in Settings */}
+        {isThreeModulesActive && (
+          <div 
+            id="three-modules-top-bar"
+            data-testid="three-modules-top-bar"
+            className="bg-white/95 backdrop-blur-md border-b border-[#DCE6E0] px-3 pt-2.5 pb-2 z-40 sticky top-0"
+          >
+            <div className="flex items-center justify-between mb-1.5 px-0.5">
+              <div className="flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-[#1F7A5C]" />
+                <span className="text-[11px] font-bold uppercase tracking-wider text-[#1B2B24]">
+                  3 Modules Active
+                </span>
+              </div>
+              <span className="text-[10px] font-medium text-[#8A9A92]">
+                Switch active module
+              </span>
+            </div>
+
+            <div className="grid grid-cols-3 gap-1.5 p-1 bg-[#EFF6F1] rounded-2xl">
+              {/* 1. Cancer Awareness */}
+              <button
+                id="module-switch-cancer"
+                data-testid="module-switch-cancer"
+                onClick={() => handleSwitchGoal('cancer_awareness')}
+                className={`py-1.5 px-1 rounded-xl text-center transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  effectiveModule === 'cancer_awareness'
+                    ? 'bg-white text-[#5A3577] font-bold shadow-xs border border-[#E4DEE9]'
+                    : 'text-[#6B6275] hover:text-[#2A2233] font-semibold text-xs'
+                }`}
+              >
+                <Shield className="w-3.5 h-3.5 shrink-0" />
+                <span className="text-[11px] truncate">Cancer</span>
+              </button>
+
+              {/* 2. Diabetes */}
+              <button
+                id="module-switch-diabetes"
+                data-testid="module-switch-diabetes"
+                onClick={() => handleSwitchGoal('diabetes_awareness')}
+                className={`py-1.5 px-1 rounded-xl text-center transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  effectiveModule === 'diabetes_awareness'
+                    ? 'bg-white text-[#1769AA] font-bold shadow-xs border border-[#DCE7EE]'
+                    : 'text-[#536675] hover:text-[#12324A] font-semibold text-xs'
+                }`}
+              >
+                <Droplet className="w-3.5 h-3.5 shrink-0" />
+                <span className="text-[11px] truncate">Diabetes</span>
+              </button>
+
+              {/* 3. Weight Loss */}
+              <button
+                id="module-switch-weight-loss"
+                data-testid="module-switch-weight-loss"
+                onClick={() => handleSwitchGoal('weight_loss')}
+                className={`py-1.5 px-1 rounded-xl text-center transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  effectiveModule === 'weight_loss'
+                    ? 'bg-white text-[#1F7A5C] font-bold shadow-xs border border-[#DCE6E0]'
+                    : 'text-[#4C5F55] hover:text-[#1B2B24] font-semibold text-xs'
+                }`}
+              >
+                <Scale className="w-3.5 h-3.5 shrink-0" />
+                <span className="text-[11px] truncate">Weight Loss</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Render Current Tab Page */}
+        <div className="flex-1">
+          {isDiabetesAwareness ? (
+            <>
+              {activeTab === 'home' && (
+                <DiabetesHomeScreen 
+                  profile={sharedProfile} 
+                  settings={diabetesSettings}
+                  onNavigate={setActiveTab} 
+                  onSwitchGoal={handleSwitchGoal} 
+                />
+              )}
+              {activeTab === 'history' && <DiabetesHistoryScreen userName={sharedProfile.fullName} />}
+              {activeTab === 'progress' && <DiabetesProgressScreen onNavigate={setActiveTab} />}
+              {activeTab === 'coach' && <DiabetesCoachScreen userName={(sharedProfile.fullName || 'Alex').split(' ')[0]} />}
+              {activeTab === 'profile' && (
+                 <ProfileScreen 
+                   activeModule={effectiveModule}
+                   accountModule={activeModule}
+                   profile={sharedProfile}
+                   onUpdateProfile={setSharedProfile}
+                   weightLossSettings={weightLossSettings}
+                   onUpdateWeightLossSettings={setWeightLossSettings}
+                   diabetesSettings={diabetesSettings}
+                   onUpdateDiabetesSettings={setDiabetesSettings}
+                   cancerSettings={cancerSettings}
+                   onUpdateCancerSettings={setCancerSettings}
+                   onSwitchGoalRequest={() => handleSwitchGoal('cancer_awareness')}
+                   onSwitchAccount={handleSwitchModule}
+                 />
+              )}
+            </>
+          ) : isCancerAwareness ? (
+            <>
+              {activeTab === 'home' && (
+                <CancerHomeScreen 
+                  profile={sharedProfile} 
+                  onNavigate={setActiveTab} 
+                  onSwitchGoal={handleSwitchGoal} 
+                />
+              )}
+              {activeTab === 'history' && <CancerHistoryScreen userName={sharedProfile.fullName} />}
+              {activeTab === 'progress' && <CancerProgressScreen onNavigate={setActiveTab} />}
+              {activeTab === 'coach' && <CancerCoachScreen userName={sharedProfile.fullName.split(' ')[0]} />}
+              {activeTab === 'profile' && (
+                <ProfileScreen 
+                  activeModule={effectiveModule}
+                  accountModule={activeModule}
+                  profile={sharedProfile}
+                  onUpdateProfile={setSharedProfile}
+                  weightLossSettings={weightLossSettings}
+                  onUpdateWeightLossSettings={setWeightLossSettings}
+                  diabetesSettings={diabetesSettings}
+                  onUpdateDiabetesSettings={setDiabetesSettings}
+                  cancerSettings={cancerSettings}
+                  onUpdateCancerSettings={setCancerSettings}
+                  onSwitchGoalRequest={() => handleSwitchGoal('weight_loss')}
+                  onSwitchAccount={handleSwitchModule}
+                />
+              )}
+            </>
+          ) : (
+            <>
+              {activeTab === 'home' && (
+                <WLHome 
+                  profile={sharedProfile}
+                  settings={weightLossSettings}
+                  onNavigate={setActiveTab} 
+                  onSwitchGoal={handleSwitchGoal}
+                  onUpdateSettings={setWeightLossSettings}
+                  initialDashboardData={wlDashboardData}
+                  onDataRefreshed={setWlDashboardData}
+                />
+              )}
+              {activeTab === 'history' && (
+                <WLHistory 
+                  profile={sharedProfile} 
+                  onNavigate={setActiveTab} 
+                />
+              )}
+              {activeTab === 'progress' && (
+                <WLProgress 
+                  profile={sharedProfile}
+                  settings={weightLossSettings}
+                  onNavigate={setActiveTab}
+                  onUpdateSettings={setWeightLossSettings}
+                />
+              )}
+              {activeTab === 'coach' && (
+                <WLCoach 
+                  profile={sharedProfile}
+                  settings={weightLossSettings}
+                  onNavigate={setActiveTab} 
+                />
+              )}
+              {activeTab === 'profile' && (
+                <WLProfile 
+                  profile={sharedProfile}
+                  settings={weightLossSettings}
+                  onUpdateProfile={setSharedProfile}
+                  onUpdateSettings={setWeightLossSettings}
+                  onRestartOnboarding={() => setIsOnboarded(false)}
+                  onSwitchGoalRequest={() => handleSwitchGoal('diabetes_awareness')}
+                  activeModule={activeModule}
+                  onSwitchAccount={handleSwitchModule}
+                />
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Global Bottom Navigation */}
+        <BottomNavigation 
+          activeTab={activeTab} 
+          onTabChange={setActiveTab} 
+          activeModule={effectiveModule}
+        />
+      </div>
+    </div>
+  );
+}
